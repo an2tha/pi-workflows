@@ -97,6 +97,31 @@ describe("loadWorkflowSettings", () => {
     });
   });
 
+  test("saves enabled flag and preserves existing model aliases", async () => {
+    const root = await makeTempRoot();
+    const project = resolve(root, "project");
+
+    await writeJson(resolve(project, ".pi/settings.json"), {
+      workflows: { fastModel: "fast", defaultModel: "heavy" },
+    });
+
+    const path = await saveWorkflowSettings(project, "project", { enabled: false, footerMode: "status" });
+    const saved = JSON.parse(await Bun.file(path).text());
+
+    expect(saved.workflows).toEqual({
+      enabled: false,
+      footerMode: "status",
+      fastModel: "fast",
+      defaultModel: "heavy",
+    });
+    await expect(loadWorkflowSettings(project)).resolves.toEqual({
+      enabled: false,
+      footerMode: "status",
+      fastModel: "fast",
+      defaultModel: "heavy",
+    });
+  });
+
   test("ignores missing or invalid settings files", async () => {
     const root = await makeTempRoot();
     const home = resolve(root, "home");
@@ -106,10 +131,7 @@ describe("loadWorkflowSettings", () => {
     await mkdir(resolve(project, ".pi"), { recursive: true });
     await Bun.write(resolve(project, ".pi/settings.json"), "{ not valid json");
 
-    await expect(loadWorkflowSettings(project)).resolves.toEqual({
-      fastModel: undefined,
-      defaultModel: undefined,
-    });
+    await expect(loadWorkflowSettings(project)).resolves.toEqual({});
   });
 });
 

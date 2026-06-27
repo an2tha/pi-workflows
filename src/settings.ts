@@ -4,8 +4,17 @@ import { dirname, resolve } from "node:path";
 export type WorkflowSettingsScope = "project" | "global";
 
 export interface WorkflowSettings {
+  /** Defaults to true when unset. */
+  enabled?: boolean;
   fastModel?: string;
   defaultModel?: string;
+  /**
+   * How pi-agent-workflows reports workflow token/cost usage in the TUI.
+   * - status: non-invasive extension status line (default)
+   * - replace: replace the main footer to fold workflow cost into core totals
+   * - off: no TUI status/footer reporting
+   */
+  footerMode?: "status" | "replace" | "off";
 }
 
 export interface PiWorkflowSettingsFile {
@@ -38,11 +47,9 @@ export async function saveWorkflowSettings(cwd: string, scope: WorkflowSettingsS
   const existing = await readSettingsFile(path);
   const next = {
     ...existing,
-    workflows: {
-      ...(existing.workflows ?? {}),
-      ...withoutUndefined(settings),
-    },
+    workflows: { ...(existing.workflows ?? {}) },
   } satisfies PiWorkflowSettingsFile;
+  applyWorkflowSettingsPatch(next.workflows!, settings);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
   return path;
@@ -71,14 +78,29 @@ function extractWorkflowSettings(settings: PiWorkflowSettingsFile): WorkflowSett
 }
 
 function mergeWorkflowSettings(base: WorkflowSettings, override: WorkflowSettings): WorkflowSettings {
-  return {
-    fastModel: override.fastModel ?? base.fastModel,
-    defaultModel: override.defaultModel ?? base.defaultModel,
-  };
+  const result: WorkflowSettings = {};
+  const enabled = override.enabled ?? base.enabled;
+  const fastModel = override.fastModel ?? base.fastModel;
+  const defaultModel = override.defaultModel ?? base.defaultModel;
+  const footerMode = override.footerMode ?? base.footerMode;
+  if (enabled !== undefined) result.enabled = enabled;
+  if (fastModel !== undefined) result.fastModel = fastModel;
+  if (defaultModel !== undefined) result.defaultModel = defaultModel;
+  if (footerMode !== undefined) result.footerMode = footerMode;
+  return result;
 }
 
-function withoutUndefined(settings: WorkflowSettings): WorkflowSettings {
-  return Object.fromEntries(Object.entries(settings).filter(([, value]) => value !== undefined)) as WorkflowSettings;
+function applyWorkflowSettingsPatch(target: WorkflowSettings, patch: WorkflowSettings): void {
+  for (const key of ["enabled", "fastModel", "defaultModel", "footerMode"] as const) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    const value = patch[key];
+    if (value === undefined) delete target[key];
+    else (target as Record<typeof key, unknown>)[key] = value;
+  }
+}
+
+export function isWorkflowEnabled(settings: WorkflowSettings): boolean {
+  return settings.enabled !== false;
 }
 
 export function describeWorkflowSettingsLocation(cwd: string): string {

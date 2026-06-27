@@ -7,12 +7,20 @@ import { renderAgentInspection, renderWorkflowTree } from "./display";
 import { WorkflowEngine } from "./engine";
 import { createWorkflowFooter } from "./footer";
 import { WorkflowOverlay } from "./tui";
-import { loadWorkflowSettings, saveWorkflowSettings, type WorkflowSettingsScope } from "./settings";
+import { isWorkflowEnabled, loadWorkflowSettings, saveWorkflowSettings, type WorkflowSettingsScope } from "./settings";
 import { textResult, type WorkflowEngineOptions, type WorkflowHostContext } from "./types";
 
 export interface WorkflowExtensionOptions extends WorkflowEngineOptions {
   engine?: WorkflowEngine;
 }
+
+const WORKFLOW_TOOL_NAMES = [
+  "workflow_spawn",
+  "workflow_status",
+  "workflow_inspect_agent",
+  "workflow_prompt",
+  "workflow_message",
+];
 
 export function createWorkflowExtension(options: WorkflowExtensionOptions = {}): ExtensionFactory {
   return (pi: ExtensionAPI) => {
@@ -25,17 +33,22 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       return autoInjectedSkillBlock;
     };
 
-    pi.on("resources_discover", () => ({ skillPaths: [skillDir] }));
-    pi.on("session_start", (_event, ctx) => {
-      if (ctx.mode !== "tui") return;
-      ctx.ui.setFooter((_tui, theme, footerData) => createWorkflowFooter(ctx, engine, theme, footerData));
+    pi.on("resources_discover", async (event) => {
+      const settings = await loadWorkflowSettings(event.cwd);
+      return isWorkflowEnabled(settings) ? { skillPaths: [skillDir] } : {};
     });
-    pi.on("session_shutdown", (_event, ctx) => {
-      if (ctx.mode === "tui") ctx.ui.setFooter(undefined);
+    pi.on("session_start", async (_event, ctx) => {
+      await applyWorkflowActivation(pi, ctx, engine);
     });
-    pi.on("before_agent_start", async (event) => ({
-      systemPrompt: appendAutoInjectedSkill(event.systemPrompt, await getAutoInjectedSkillBlock()),
-    }));
+    pi.on("after_provider_response", async (_event, ctx) => {
+      const settings = await loadWorkflowSettings(ctx.cwd);
+      if (isWorkflowEnabled(settings) && (settings.footerMode ?? "status") === "status") updateWorkflowStatus(ctx, engine);
+    });
+    pi.on("before_agent_start", async (event, ctx) => {
+      const settings = await loadWorkflowSettings(ctx.cwd);
+      if (!isWorkflowEnabled(settings)) return undefined;
+      return { systemPrompt: appendAutoInjectedSkill(event.systemPrompt, await getAutoInjectedSkillBlock()) };
+    });
 
     const SpawnParams = Type.Object({
       planJson: Type.String({
@@ -89,6 +102,7 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       parameters: SpawnParams,
       executionMode: "sequential",
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        await assertWorkflowEnabled(ctx);
         const knownRuns = new Set(engine.getRuns().map((run) => run.id));
         let currentRunId: string | undefined;
         let requestOverlayRender: (() => void) | undefined;
@@ -126,6 +140,9 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
           const run = getDisplayedRun();
           currentRunId = run?.id ?? currentRunId;
           if (!overlayClosed) requestOverlayRender?.();
+          void loadWorkflowSettings(ctx.cwd).then((settings) => {
+            if (isWorkflowEnabled(settings) && (settings.footerMode ?? "status") === "status") updateWorkflowStatus(ctx, engine);
+          });
           onUpdate?.(textResult(renderWorkflowTree(run, { includeOutputs: true }), run ? compactRunSnapshot(engine, run) : { status: "starting" }));
         };
 
@@ -152,7 +169,8 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       promptSnippet: "workflow_status: inspect prior workflow runs and agent outputs.",
       parameters: StatusParams,
       executionMode: "parallel",
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        await assertWorkflowEnabled(ctx);
         const run = params.runId ? engine.getRun(params.runId) : engine.getRuns().at(-1);
         if (!run) return textResult<unknown>("No workflow run found.", { found: false });
         const snapshot = snapshotRun(run);
@@ -174,7 +192,8 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       promptSnippet: "workflow_inspect_agent: inspect one subagent in a workflow tree.",
       parameters: InspectAgentParams,
       executionMode: "parallel",
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        await assertWorkflowEnabled(ctx);
         const run = params.runId ? engine.getRun(params.runId) : engine.getRuns().at(-1);
         const text = renderAgentInspection(run, params.agentId, {
           includeMessages: params.includeMessages,
@@ -192,7 +211,8 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       promptSnippet: "workflow_prompt: steer an active subagent with an injected prompt.",
       parameters: PromptAgentParams,
       executionMode: "parallel",
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        await assertWorkflowEnabled(ctx);
         const run = params.runId ? engine.getRun(params.runId) : engine.getRuns().at(-1);
         if (!run) throw new Error("No workflow run found.");
         const result = engine.injectPrompt(run.id, params.agentId, params.prompt, params.mode ?? "steer");
@@ -207,7 +227,8 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
       promptSnippet: "workflow_message: send a message to a workflow agent/channel.",
       parameters: MessageParams,
       executionMode: "parallel",
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        await assertWorkflowEnabled(ctx);
         const run = engine.getRun(params.runId);
         if (!run) throw new Error(`Workflow run not found: ${params.runId}`);
         const message = sendMessage(run, {
@@ -224,13 +245,14 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
     pi.registerCommand("workflow-settings", {
       description: "Configure workflow fast/default model aliases.",
       async handler(args, ctx) {
-        await configureWorkflowSettings(args, ctx);
+        await configureWorkflowSettings(args, ctx, pi, engine);
       },
     });
 
     pi.registerCommand("workflow-classes", {
       description: "List registered workflow agent classes and subagent tools.",
       async handler(_args, ctx) {
+        if (!(await notifyIfWorkflowDisabled(ctx))) return;
         const classes = engine.getAgentClasses().map((item) => ({
           name: item.name,
           description: item.description,
@@ -246,6 +268,7 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
     pi.registerCommand("workflow-inspect", {
       description: "Inspect a workflow subagent. Usage: /workflow-inspect [runId] <agentId>",
       async handler(args, ctx) {
+        if (!(await notifyIfWorkflowDisabled(ctx))) return;
         const parts = args.trim().split(/\s+/).filter(Boolean);
         const latestRun = engine.getRuns().at(-1);
         const runId = parts.length >= 2 ? parts[0] : latestRun?.id;
@@ -258,6 +281,7 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
     pi.registerCommand("workflow-prompt", {
       description: "Inject a prompt into an active workflow subagent. Usage: /workflow-prompt [runId] <agentId> <prompt>",
       async handler(args, ctx) {
+        if (!(await notifyIfWorkflowDisabled(ctx))) return;
         const parts = args.trim().split(/\s+/).filter(Boolean);
         const latestRun = engine.getRuns().at(-1);
         const runId = parts.length >= 3 ? parts.shift() : latestRun?.id;
@@ -274,10 +298,65 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
   };
 }
 
-async function configureWorkflowSettings(args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function applyWorkflowActivation(pi: ExtensionAPI, ctx: ExtensionContext, engine: WorkflowEngine): Promise<void> {
+  const settings = await loadWorkflowSettings(ctx.cwd);
+  const activeTools = pi.getActiveTools();
+  const enabled = isWorkflowEnabled(settings);
+  const nextTools = enabled
+    ? Array.from(new Set([...activeTools, ...WORKFLOW_TOOL_NAMES]))
+    : activeTools.filter((tool) => !WORKFLOW_TOOL_NAMES.includes(tool));
+  if (nextTools.join("\0") !== activeTools.join("\0")) pi.setActiveTools(nextTools);
+
+  if (ctx.mode !== "tui") return;
+  if (!enabled) {
+    ctx.ui.setStatus("pi-workflows", "workflow: off");
+    return;
+  }
+
+  if (settings.footerMode === "replace") {
+    ctx.ui.setFooter((_tui, theme, footerData) => createWorkflowFooter(ctx, engine, theme, footerData));
+    ctx.ui.setStatus("pi-workflows", undefined);
+  } else if (settings.footerMode === "off") {
+    ctx.ui.setStatus("pi-workflows", undefined);
+  } else {
+    updateWorkflowStatus(ctx, engine);
+  }
+}
+
+function updateWorkflowStatus(ctx: ExtensionContext, engine: WorkflowEngine): void {
+  if (ctx.mode !== "tui") return;
+  const usage = engine.getWorkflowUsage(ctx.sessionManager.getSessionId());
+  if (!usage?.totalTokens) {
+    ctx.ui.setStatus("pi-workflows", undefined);
+    return;
+  }
+  ctx.ui.setStatus("pi-workflows", `wf ↑${formatCompact(usage.input)} ↓${formatCompact(usage.output)} $${(usage.cost ?? 0).toFixed(3)}`);
+}
+
+async function assertWorkflowEnabled(ctx: ExtensionContext): Promise<void> {
+  const settings = await loadWorkflowSettings(ctx.cwd);
+  if (!isWorkflowEnabled(settings)) {
+    throw new Error("pi-agent-workflows is disabled in settings. Run /workflow-settings enable to re-enable it.");
+  }
+}
+
+async function notifyIfWorkflowDisabled(ctx: ExtensionCommandContext): Promise<boolean> {
+  const settings = await loadWorkflowSettings(ctx.cwd);
+  if (isWorkflowEnabled(settings)) return true;
+  ctx.ui.notify("pi-agent-workflows is disabled. Run /workflow-settings enable to re-enable it.", "warning");
+  return false;
+}
+
+function formatCompact(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return `${value}`;
+}
+
+async function configureWorkflowSettings(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI, engine: WorkflowEngine): Promise<void> {
   const trimmed = args.trim();
   if (trimmed) {
-    const handled = await configureWorkflowSettingsFromArgs(trimmed, ctx);
+    const handled = await configureWorkflowSettingsFromArgs(trimmed, ctx, pi, engine);
     if (handled) return;
   }
 
@@ -287,6 +366,25 @@ async function configureWorkflowSettings(args: string, ctx: ExtensionCommandCont
     : "project (.pi/settings.json)";
   if (!scopeChoice) return;
   const scope: WorkflowSettingsScope = scopeChoice.startsWith("global") ? "global" : "project";
+
+  const enabledChoice = ctx.hasUI
+    ? await ctx.ui.select("pi-agent-workflows", [
+        `keep current (${isWorkflowEnabled(current) ? "enabled" : "disabled"})`,
+        "enabled",
+        "disabled",
+      ], { timeout: 120000 })
+    : `keep current (${isWorkflowEnabled(current) ? "enabled" : "disabled"})`;
+  if (!enabledChoice) return;
+
+  const footerChoice = ctx.hasUI
+    ? await ctx.ui.select("Workflow TUI reporting", [
+        `keep current (${current.footerMode ?? "status"})`,
+        "status (non-invasive; recommended)",
+        "replace main footer (may conflict with other footer extensions)",
+        "off",
+      ], { timeout: 120000 })
+    : `keep current (${current.footerMode ?? "status"})`;
+  if (!footerChoice) return;
 
   const modelChoices = workflowModelChoices(ctx);
   const keepFast = `keep current fast (${current.fastModel ?? "unset"})`;
@@ -303,17 +401,26 @@ async function configureWorkflowSettings(args: string, ctx: ExtensionCommandCont
     : keepDefault;
   if (!defaultChoice) return;
 
+  const enabled = enabledChoice.startsWith("keep current") ? current.enabled : enabledChoice === "enabled";
+  const footerMode = footerChoice.startsWith("keep current")
+    ? current.footerMode
+    : footerChoice.startsWith("replace")
+      ? "replace"
+      : footerChoice.startsWith("off")
+        ? "off"
+        : "status";
   const fastModel = fastChoice === keepFast ? current.fastModel : fastChoice === clearFast ? undefined : parseWorkflowModelChoice(fastChoice);
   const defaultModel = defaultChoice === keepDefault ? current.defaultModel : defaultChoice === clearDefault ? undefined : parseWorkflowModelChoice(defaultChoice);
-  const path = await saveWorkflowSettings(ctx.cwd, scope, { fastModel, defaultModel });
-  ctx.ui.notify(`Saved workflow models to ${path}:\n@fast = ${fastModel ?? "unset"}\n@default = ${defaultModel ?? "unset"}`, "info");
+  const path = await saveWorkflowSettings(ctx.cwd, scope, { enabled, footerMode, fastModel, defaultModel });
+  await applyWorkflowActivation(pi, ctx, engine);
+  ctx.ui.notify(`Saved workflow settings to ${path}:\nenabled = ${enabled ?? true}\nfooterMode = ${footerMode ?? "status"}\n@fast = ${fastModel ?? "unset"}\n@default = ${defaultModel ?? "unset"}`, "info");
 }
 
-async function configureWorkflowSettingsFromArgs(args: string, ctx: ExtensionCommandContext): Promise<boolean> {
+async function configureWorkflowSettingsFromArgs(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI, engine: WorkflowEngine): Promise<boolean> {
   const parts = args.split(/\s+/).filter(Boolean);
   if (parts[0] === "show" || parts[0] === "list") {
     const current = await loadWorkflowSettings(ctx.cwd);
-    ctx.ui.notify(`Workflow models:\n@fast = ${current.fastModel ?? "unset"}\n@default = ${current.defaultModel ?? "unset"}`, "info");
+    ctx.ui.notify(`Workflow settings:\nenabled = ${isWorkflowEnabled(current)}\nfooterMode = ${current.footerMode ?? "status"}\n@fast = ${current.fastModel ?? "unset"}\n@default = ${current.defaultModel ?? "unset"}`, "info");
     return true;
   }
 
@@ -321,11 +428,24 @@ async function configureWorkflowSettingsFromArgs(args: string, ctx: ExtensionCom
   if (parts[0] === "global" || parts[0] === "project") scope = parts.shift() as WorkflowSettingsScope;
   const key = parts.shift();
   const value = parts.join(" ").trim();
+  if (key === "enable" || key === "enabled" || key === "disable" || key === "disabled") {
+    const enabled = key === "enable" || key === "enabled";
+    const path = await saveWorkflowSettings(ctx.cwd, scope, { enabled });
+    await applyWorkflowActivation(pi, ctx, engine);
+    ctx.ui.notify(`Saved pi-agent-workflows ${enabled ? "enabled" : "disabled"} to ${path}`, "info");
+    return true;
+  }
+
+  if (key === "footer" && (value === "status" || value === "replace" || value === "off")) {
+    const path = await saveWorkflowSettings(ctx.cwd, scope, { footerMode: value });
+    await applyWorkflowActivation(pi, ctx, engine);
+    ctx.ui.notify(`Saved workflow footer mode to ${path}: ${value}`, "info");
+    return true;
+  }
+
   if ((key === "fast" || key === "default") && value) {
-    const current = await loadWorkflowSettings(ctx.cwd);
     const path = await saveWorkflowSettings(ctx.cwd, scope, {
-      fastModel: key === "fast" ? value : current.fastModel,
-      defaultModel: key === "default" ? value : current.defaultModel,
+      [key === "fast" ? "fastModel" : "defaultModel"]: value,
     });
     ctx.ui.notify(`Saved ${key} workflow model to ${path}: ${value}`, "info");
     return true;
@@ -333,7 +453,7 @@ async function configureWorkflowSettingsFromArgs(args: string, ctx: ExtensionCom
 
   if (args.trim()) {
     ctx.ui.notify(
-      "Usage: /workflow-settings, /workflow-settings show, /workflow-settings [project|global] fast <provider/model>, /workflow-settings [project|global] default <provider/model>",
+      "Usage: /workflow-settings, /workflow-settings show, /workflow-settings [project|global] enable|disable, /workflow-settings [project|global] footer status|replace|off, /workflow-settings [project|global] fast <provider/model>, /workflow-settings [project|global] default <provider/model>",
       "warning",
     );
     return true;

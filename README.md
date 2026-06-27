@@ -40,10 +40,14 @@ For local development, try a checkout without installing:
 pi -e /path/to/pi-workflows/index.ts
 ```
 
-Configure workflow model aliases interactively:
+Configure workflow model aliases, enable/disable the extension, and choose non-invasive status vs footer replacement mode:
 
 ```text
 /workflow-settings
+/workflow-settings show
+/workflow-settings disable
+/workflow-settings enable
+/workflow-settings footer status
 ```
 
 ## Example plan

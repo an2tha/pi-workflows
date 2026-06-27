@@ -30,6 +30,7 @@ describe("createWorkflowExtension", () => {
     const tools: Array<{ name: string }> = [];
     const commands: string[] = [];
     const handlers = new Map<string, Function[]>();
+    let activeTools: string[] = [];
     const pi = {
       on(event: string, handler: Function) {
         const list = handlers.get(event) ?? [];
@@ -41,6 +42,12 @@ describe("createWorkflowExtension", () => {
       },
       registerCommand(name: string) {
         commands.push(name);
+      },
+      getActiveTools() {
+        return activeTools;
+      },
+      setActiveTools(next: string[]) {
+        activeTools = next;
       },
       exec() {
         throw new Error("not used in this test");
@@ -68,12 +75,13 @@ describe("createWorkflowExtension", () => {
 
     const beforeAgentStart = handlers.get("before_agent_start")?.[0];
     expect(typeof beforeAgentStart).toBe("function");
+    const ctx = { cwd: process.cwd() };
     const injected = await beforeAgentStart?.({
       type: "before_agent_start",
       prompt: "do work",
       systemPrompt: "base prompt",
       systemPromptOptions: {},
-    });
+    }, ctx);
     expect(injected.systemPrompt).toContain("pi-workflows:auto-injected-skill");
     expect(injected.systemPrompt).toContain("<skill name=\"pi-workflows\"");
     expect(injected.systemPrompt).toContain("Use the workflow engine whenever it can reduce latency");
@@ -83,7 +91,23 @@ describe("createWorkflowExtension", () => {
       prompt: "do work",
       systemPrompt: injected.systemPrompt,
       systemPromptOptions: {},
-    });
+    }, ctx);
     expect(reinjected.systemPrompt.match(/pi-workflows:auto-injected-skill/g)).toHaveLength(1);
+
+    let footerSet = false;
+    let statusValue: string | undefined;
+    const sessionStart = handlers.get("session_start")?.[0];
+    await sessionStart?.({ type: "session_start", reason: "startup" }, {
+      cwd: process.cwd(),
+      mode: "tui",
+      sessionManager: { getSessionId: () => "session-test" },
+      ui: {
+        setFooter: () => { footerSet = true; },
+        setStatus: (_key: string, value: string | undefined) => { statusValue = value; },
+      },
+    });
+    expect(footerSet).toBe(false);
+    expect(statusValue).toBeUndefined();
+    expect(activeTools).toEqual(expect.arrayContaining(["workflow_spawn", "workflow_status"]));
   });
 });

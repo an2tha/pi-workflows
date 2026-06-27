@@ -92,11 +92,13 @@ Skills available or loaded in the root conversation are inherited by workflow su
 
 ## Settings
 
-Workflow model aliases can be configured in `~/.pi/agent/settings.json` or `.pi/settings.json`:
+Workflow model aliases and extension enablement can be configured with `/workflow-settings` or in `~/.pi/agent/settings.json` / `.pi/settings.json`:
 
 ```json
 {
   "workflows": {
+    "enabled": true,
+    "footerMode": "status",
     "fastModel": "openai-codex/codex-5.3-spark",
     "defaultModel": "anthropic/claude-sonnet-4-5"
   }
